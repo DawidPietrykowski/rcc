@@ -5,5 +5,9 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.98"
+chrono = "0.4.41"
 clap = { version = "4.5.38", features = ["derive"] }
+glob = "0.3.2"
+mp4 = "0.14.0"
 rexiv2 = "0.10.0"
+xmp_toolkit = "1.10.0"
