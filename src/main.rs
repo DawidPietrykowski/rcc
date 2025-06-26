@@ -1,37 +1,35 @@
 use anyhow::{Error, Result, anyhow, bail};
 use chrono::DateTime;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, ValueEnum};
 use nom_exif::*;
+use num_rational::Ratio;
 use rexiv2::Metadata;
-use std::ffi::{OsStr, OsString};
-use std::fmt::Debug;
-use std::fmt::{Display, Formatter};
+use std::ffi::OsStr;
+use std::fmt::{Debug, Display};
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Write};
 use std::ops::{Mul, Sub};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use std::{fmt, fs, io};
+use std::{fs, io};
 
 mod xmp;
 
 const IMAGE_EXTENSIONS: [&str; 3] = ["heic", "jpg", "jpeg"];
 const VIDEOS_EXTENSIONS: [&str; 3] = ["mov", "mp4", "avi"];
 
+const MP4_TO_UNIX_OFFSET: u64 = 2_082_844_800;
+
 #[derive(Clone, Eq, PartialEq, Debug)]
 struct CollectedMetadata {
-    base_file_name: String,
-    file_size: u64,
-    extension: String,
-    creation_date: Option<String>,
-    video_duration: Option<Duration>,
+    file_metadata: FileMetadata,
+    image_metadata: Option<ImageMetadata>,
+    video_metadata: Option<VideoMetadata>,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 struct Cli {
-    // #[command(subcommand)]
-    // command: FileCommand,
     #[arg(short = 'v', long, default_value_t = false)]
     verbose: bool,
 
@@ -47,6 +45,12 @@ struct Cli {
     #[arg(value_enum, default_value_t = CompareMode::Paranoid)]
     mode: CompareMode,
 
+    #[arg(short = 'o', long, default_value = "run.sh")]
+    output: PathBuf,
+
+    #[arg(short = 'c', long)]
+    command: Option<FileCommand>,
+
     #[arg(short, long)]
     dest: PathBuf,
 
@@ -56,7 +60,7 @@ struct Cli {
     src: PathBuf,
 }
 
-#[derive(Subcommand, PartialEq)]
+#[derive(PartialEq, Clone, Copy, ValueEnum)]
 enum FileCommand {
     Move,
     Copy,
@@ -70,23 +74,6 @@ enum CompareMode {
     Paranoid,
 }
 
-impl Display for ComparisonCommand {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        match self {
-            ComparisonCommand::MoreEqual => write!(f, "more-equal"),
-            ComparisonCommand::LessEqual => write!(f, "less-equal"),
-            ComparisonCommand::Equal => write!(f, "equal"),
-        }
-    }
-}
-
-#[derive(ValueEnum, Clone, Debug)]
-enum ComparisonCommand {
-    MoreEqual,
-    LessEqual,
-    Equal,
-}
-
 #[derive(Clone, Eq, PartialEq, Debug)]
 struct Entry {
     path: PathBuf,
@@ -94,46 +81,182 @@ struct Entry {
     is_dest: bool,
 }
 
-fn entries_match(a: &CollectedMetadata, b: &CollectedMetadata, mode: CompareMode) -> bool {
-    if let Some(date) = compare_if_exist(&a.creation_date, &b.creation_date) {
-        if !date {
-            // println!("mismatch date");
+impl Display for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("dest: {}", self.is_dest))?;
+        f.write_fmt(format_args!(" p: {:?}", self.path))?;
+        f.write_fmt(format_args!(" m: {}", self.metadata))?;
+        Ok(())
+    }
+}
+
+impl Display for CollectedMetadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("f: {}", self.file_metadata))?;
+        if let Some(meta) = self.image_metadata.clone() {
+            f.write_fmt(format_args!(" i: {}", meta))?;
+        }
+        if let Some(meta) = self.video_metadata.clone() {
+            f.write_fmt(format_args!(" v: {}", meta))?;
+        }
+        Ok(())
+    }
+}
+
+impl Display for FileMetadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("base: {}", self.base_file_name))?;
+        f.write_fmt(format_args!(" s: {}", self.file_size))?;
+        f.write_fmt(format_args!(" e: {}", self.extension))?;
+        if let Some(date) = self.creation_date.clone() {
+            f.write_fmt(format_args!(" d: {}", date))?;
+        }
+        Ok(())
+    }
+}
+
+impl Display for VideoMetadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("date: {}", self.date))?;
+        if let Some(duration) = self.video_duration.clone() {
+            f.write_fmt(format_args!(" d: {:?}", duration))?;
+        }
+        Ok(())
+    }
+}
+
+impl Display for ImageMetadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("date: {}", self.date))?;
+        if let Some(model) = self.model.clone() {
+            f.write_fmt(format_args!(" {}", model))?;
+        }
+        if let Some((x, y)) = self.resolution.clone() {
+            f.write_fmt(format_args!(" {}x{}", x, y))?;
+        }
+        if let Some(brightness) = self.brightness.clone() {
+            f.write_fmt(format_args!(" b: {}", brightness))?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default, Clone, Eq, PartialEq, Debug)]
+struct ImageMetadata {
+    date: String,
+    resolution: Option<(Ratio<i32>, Ratio<i32>)>,
+    model: Option<String>,
+    brightness: Option<String>,
+}
+
+#[derive(Default, Clone, Eq, PartialEq, Debug)]
+struct FileMetadata {
+    base_file_name: String,
+    file_size: u64,
+    extension: String,
+    creation_date: Option<String>,
+}
+
+trait CompareMetadata<T> {
+    fn metadata_matches(a: &T, b: &T, mode: Cli) -> bool;
+}
+
+#[derive(Default, Clone, Eq, PartialEq, Debug)]
+struct VideoMetadata {
+    date: String,
+    video_duration: Option<Duration>,
+}
+
+impl CompareMetadata<VideoMetadata> for VideoMetadata {
+    fn metadata_matches(a: &VideoMetadata, b: &VideoMetadata, cli: Cli) -> bool {
+        if a.date != b.date {
             return false;
         }
-        // println!("match on video date");
-    } else {
-        return false;
-    }
 
-    if let Some(date) = compare_if_exist(&a.video_duration, &b.video_duration) {
-        if !date {
-            // println!("mismatch on video duration");
+        if let Some(duration) = compare_if_exist(&a.video_duration, &b.video_duration) {
+            if !duration {
+                return false;
+            }
+        } else {
+            if cli.mode == CompareMode::Paranoid {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+impl CompareMetadata<ImageMetadata> for ImageMetadata {
+    fn metadata_matches(a: &ImageMetadata, b: &ImageMetadata, _cli: Cli) -> bool {
+        if a.date != b.date {
             return false;
         }
-    } else {
-        if VIDEOS_EXTENSIONS.contains(&a.extension.as_str()) && mode == CompareMode::Paranoid {
+
+        if let Some(model) = compare_if_exist(&a.model, &b.model) {
+            if !model {
+                return false;
+            }
+        }
+
+        if let Some(brightness) = compare_if_exist(&a.brightness, &b.brightness) {
+            if !brightness {
+                return false;
+            }
+        }
+        if let Some(resolution) = compare_if_exist(&a.resolution, &b.resolution) {
+            if !resolution {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl CompareMetadata<FileMetadata> for FileMetadata {
+    fn metadata_matches(a: &FileMetadata, b: &FileMetadata, _cli: Cli) -> bool {
+        if !compare_with_tolerance(a.file_size as f32, b.file_size as f32) {
+            // println!("mismatch on size");
             return false;
         }
-    }
 
-    if !compare_with_tolerance(a.file_size as f32, b.file_size as f32) {
-        // println!("mismatch on size");
+        if a.extension != b.extension {
+            // println!("mismatch on extension");
+            return false;
+        }
+
+        true
+    }
+}
+
+fn entries_match(a: &CollectedMetadata, b: &CollectedMetadata, mode: Cli) -> bool {
+    if !FileMetadata::metadata_matches(&a.file_metadata, &b.file_metadata, mode.clone()) {
         return false;
     }
-
-    if a.extension != b.extension {
-        // println!("mismatch on extension");
-        return false;
+    let mut metadata_checked = false;
+    if let (Some(a), Some(b)) = (&a.image_metadata, &b.image_metadata) {
+        if !ImageMetadata::metadata_matches(a, b, mode.clone()) {
+            return false;
+        }
+        metadata_checked = true;
+    }
+    if let (Some(a), Some(b)) = (&a.video_metadata, &b.video_metadata) {
+        if !VideoMetadata::metadata_matches(a, b, mode.clone()) {
+            return false;
+        }
+        metadata_checked = true;
     }
 
-    return true;
+    return metadata_checked;
 }
 
 fn compare_if_exist<T: PartialEq>(a: &Option<T>, b: &Option<T>) -> Option<bool> {
-    if let (Some(a_date), Some(b_date)) = (a, b) {
-        return Some(a_date == b_date);
+    match (a, b) {
+        (Some(a_val), Some(b_val)) => return Some(a_val == b_val),
+        (None, None) => None,
+        (None, Some(_)) => Some(false),
+        (Some(_), None) => Some(false),
     }
-    None
 }
 
 const TOLERANCE: f32 = 0.01;
@@ -147,12 +270,14 @@ where
     let min = if a > b { b } else { a };
     let max_diff = max * TOLERANCE;
     let diff = max - min;
-    // println!("diff: {:?} max: {:?}", diff, max_diff);
     return diff < max_diff;
 }
 
-// fn handle_duplicate(entry: &Entry) {
-// }
+struct Action {
+    entry: Entry,
+    dest_entry: Entry,
+    action: FileCommand,
+}
 
 fn main() {
     let cli: Cli = Cli::parse();
@@ -166,6 +291,8 @@ fn main() {
 
     let mut saved_space = 0u64;
 
+    let mut actions = vec![];
+
     for dest_entry in dest_entries {
         for src_entry in &src_entries {
             if *src_entry.path == dest_entry.path {
@@ -175,17 +302,31 @@ fn main() {
                 );
                 continue;
             }
-            if entries_match(&dest_entry.metadata, &src_entry.metadata, cli.mode) {
+            if entries_match(&dest_entry.metadata, &src_entry.metadata, cli.clone()) {
                 println!(
                     "Duplicate found for: {}: {}",
                     dest_entry.path.display(),
                     src_entry.path.display()
                 );
-                saved_space += src_entry.metadata.file_size;
-                // handle_duplicate(src_entry);
-            } else if dest_entry.metadata.base_file_name == src_entry.metadata.base_file_name {
+                if dest_entry.metadata.file_metadata.base_file_name
+                    != src_entry.metadata.file_metadata.base_file_name
+                {
+                    println!("Files have different names");
+                }
+
+                saved_space += src_entry.metadata.file_metadata.file_size;
+                if let Some(command) = cli.command {
+                    actions.push(Action {
+                        entry: src_entry.clone(),
+                        dest_entry: dest_entry.clone(),
+                        action: command,
+                    });
+                }
+            } else if dest_entry.metadata.file_metadata.base_file_name
+                == src_entry.metadata.file_metadata.base_file_name
+            {
                 println!(
-                    "Files have the same base name but did not match: \n\n{:?}\n\n{:?}",
+                    "\nFiles have the same base name but did not match: \n{:?}\n{:?}",
                     dest_entry, src_entry
                 );
             }
@@ -199,6 +340,32 @@ fn main() {
         format!("{}MB", saved_mb)
     };
     println!("Total saved space: {}", size_str);
+
+    let mut execution_file = File::create(cli.output).unwrap();
+    execution_file.write("#! /bin/env sh\n".as_bytes()).unwrap();
+    for action in actions {
+        execution_file
+            .write_fmt(format_args!(
+                "\n# destination: {:?}\n",
+                action.dest_entry.path
+            ))
+            .unwrap();
+        match action.action {
+            FileCommand::Move => todo!(),
+            FileCommand::Copy => todo!(),
+            FileCommand::Delete => {
+                execution_file
+                    .write_fmt(format_args!("rm {:?}\n", action.entry.path))
+                    .unwrap();
+            }
+            FileCommand::Print => todo!(),
+        }
+    }
+    let mut perms = execution_file.metadata().unwrap().permissions();
+    let mode = perms.mode();
+    perms.set_mode(mode | 0o1 /* execute */);
+    execution_file.set_permissions(perms).unwrap();
+    execution_file.flush().unwrap();
 }
 
 fn scan_directories(dir_paths: &Vec<PathBuf>, is_dest: bool, cli: &Cli) -> Vec<Entry> {
@@ -233,7 +400,7 @@ fn scan_directories(dir_paths: &Vec<PathBuf>, is_dest: bool, cli: &Cli) -> Vec<E
             is_dest,
         };
 
-        println!("Adding: {:?}", entry);
+        println!("Adding: {}", entry);
 
         entries.push(entry)
 
@@ -393,49 +560,83 @@ fn is_file_allowed(filename: &PathBuf, include_videos: bool) -> bool {
     false
 }
 
-fn get_metadata(filename: &PathBuf) -> Result<CollectedMetadata> {
-    Ok(CollectedMetadata {
-        base_file_name: filename
-            .file_name()
-            .ok_or(Error::msg("File metadata read error"))?
-            .to_os_string()
-            .into_string()
-            .unwrap(),
-        file_size: filename.metadata()?.size(),
-        creation_date: get_timestamp(filename).ok(),
-        video_duration: get_mp4_duration(filename).ok(),
-        extension: filename
-            .extension()
-            .unwrap()
-            .to_os_string()
-            .into_string()
-            .unwrap()
-            .to_lowercase(),
-    })
-}
-fn get_timestamp(filename: &PathBuf) -> Result<String> {
+fn get_file_metadata(filename: &PathBuf) -> Result<FileMetadata> {
     if !path_exists(filename.clone()) {
         anyhow::bail!("File doesn't exist");
     }
 
-    if is_video(&filename) {
-        // return read_timestamp_xmp(filename.clone());
-        return get_mp4_timestamp(filename);
+    let extension = filename
+        .extension()
+        .unwrap()
+        .to_os_string()
+        .into_string()
+        .unwrap()
+        .to_lowercase();
+    let base_file_name = filename
+        .file_name()
+        .ok_or(Error::msg("File metadata read error"))?
+        .to_os_string()
+        .into_string()
+        .unwrap();
+    let file_size = filename.metadata()?.size();
+    let creation_date = filename
+        .metadata()?
+        .created()
+        .ok()
+        .map(|t| format!("{:?}", t));
+
+    Ok(FileMetadata {
+        extension,
+        base_file_name,
+        file_size,
+        creation_date,
+    })
+}
+
+fn get_image_metadata(filename: &PathBuf) -> Result<ImageMetadata> {
+    if !path_exists(filename.clone()) {
+        anyhow::bail!("File doesn't exist");
     }
 
-    // Use rexiv2 for image files
-    let meta = Metadata::new_from_path(filename);
-    match meta {
-        Ok(meta) => {
-            // println!("TAGS: {:?}", meta.get_exif_tags());
-            if let Ok(rating) = meta.get_tag_string("Exif.Photo.DateTimeOriginal") {
-                return Ok(rating);
-            } else {
-                anyhow::bail!("Not found");
-            }
-        }
-        Err(e) => anyhow::bail!(e),
+    let mut image_meta = ImageMetadata::default();
+
+    assert!(!is_video(&filename));
+    let meta = Metadata::new_from_path(filename)?;
+    image_meta.date = meta.get_tag_string("Exif.Photo.DateTimeOriginal")?;
+    let xres = meta.get_tag_rational("Exif.Photo.PixelXDimension");
+    let yres = meta.get_tag_rational("Exif.Photo.PixelYDimension");
+    if xres.is_some() && yres.is_some() {
+        image_meta.resolution = Some((xres.unwrap(), yres.unwrap()));
+    } else {
+        // for tag in meta.get_exif_tags().unwrap().iter().filter(|f| !f.contains("Sony") && !f.contains("Note")) {
+        //     println!("tag: {:?} val: {:?}", tag, meta.get_tag_interpreted_string(tag.as_str()));
+        // }
     }
+    image_meta.model = meta.get_tag_string("Exif.Image.Model").ok();
+    image_meta.brightness = meta.get_tag_string("Exif.Photo.BrightnessValue").ok();
+    Ok(image_meta)
+}
+
+fn get_video_metadata(filename: &PathBuf) -> Result<VideoMetadata> {
+    if !path_exists(filename.clone()) {
+        anyhow::bail!("File doesn't exist");
+    }
+
+    let mut video_meta = VideoMetadata::default();
+
+    let mut parser = MediaParser::new();
+    let ms = MediaSource::file_path(filename)?;
+    assert!(ms.has_track());
+    let track_info: TrackInfo = parser.parse(ms)?;
+    video_meta.video_duration = track_info
+        .get(TrackInfoTag::DurationMs)
+        .map(|f| Duration::from_millis(f.as_u64().unwrap()));
+    video_meta.date = track_info
+        .get(TrackInfoTag::CreateDate)
+        .map(|f| f.as_time().unwrap().to_rfc3339())
+        .unwrap();
+
+    return Ok(video_meta);
 }
 
 fn is_video(path: &Path) -> bool {
@@ -449,64 +650,34 @@ fn is_video(path: &Path) -> bool {
 }
 
 fn get_metadata_nom(filename: &PathBuf) -> Result<CollectedMetadata> {
-    let extension = filename
-        .extension()
-        .unwrap()
-        .to_os_string()
-        .into_string()
-        .unwrap()
-        .to_lowercase();
+    let file_metadata = get_file_metadata(filename)?;
+    let image_metadata;
+    let video_metadata;
 
-    let date;
-    let duration;
-
-    println!("file: {:?}", filename);
-    if extension == "mp4" {
-        date = get_timestamp(filename).unwrap_or(format!(
-            "{:?}",
-            filename.metadata().unwrap().modified().unwrap()
-        ));
-        duration = get_mp4_duration(filename).ok();
-    } else if VIDEOS_EXTENSIONS.contains(&extension.as_str()) {
-        let mut parser = MediaParser::new();
-        let ms = MediaSource::file_path(filename)?;
-        assert!(ms.has_track());
-        let track_info: TrackInfo = parser.parse(ms)?;
-        duration = track_info
-            .get(TrackInfoTag::DurationMs)
-            .map(|f| Duration::from_millis(f.as_u64().unwrap()));
-        date = track_info
-            .get(TrackInfoTag::CreateDate)
-            .map(|f| f.as_time().unwrap().to_rfc3339())
-            .unwrap();
+    // println!("file: {:?}", filename);
+    if file_metadata.extension == "mp4" {
+        image_metadata = None;
+        video_metadata = Some(get_mp4_metadata(filename)?);
+    } else if VIDEOS_EXTENSIONS.contains(&file_metadata.extension.as_str()) {
+        image_metadata = None;
+        video_metadata = Some(get_video_metadata(filename)?);
     } else {
-        // assert!(ms.has_exif());
-        // let iter: ExifIter = parser.parse(ms).unwrap();
-        // let exif: Exif = iter.into();
-        // date = exif.get(ExifTag::CreateDate).unwrap().to_string();
-        date = get_timestamp(filename).unwrap_or(format!(
-            "{:?}",
-            filename.metadata().unwrap().modified().unwrap()
-        ));
-        duration = None;
+        image_metadata = Some(get_image_metadata(filename)?);
+        video_metadata = None;
     };
 
     Ok(CollectedMetadata {
-        base_file_name: filename
-            .file_name()
-            .ok_or(Error::msg("File metadata read error"))?
-            .to_os_string()
-            .into_string()
-            .unwrap(),
-        file_size: filename.metadata()?.size(),
-        creation_date: Some(date),
-        video_duration: duration,
-        extension,
+        file_metadata,
+        image_metadata,
+        video_metadata,
     })
 }
 
-fn get_mp4_timestamp(filename: &PathBuf) -> Result<String> {
-    let mp4 = read_mp4_video(filename)?;
+fn get_mp4_metadata(filename: &PathBuf) -> Result<VideoMetadata> {
+    let f = File::open(filename)?;
+    let size = f.metadata()?.len();
+    let reader = BufReader::new(f);
+    let mp4 = mp4::Mp4Reader::read_header(reader, size)?;
 
     if mp4.moov.mvhd.creation_time == 0 {
         bail!("no creation time");
@@ -517,26 +688,8 @@ fn get_mp4_timestamp(filename: &PathBuf) -> Result<String> {
         mp4.moov.mvhd.creation_time
     };
     let dt = DateTime::from_timestamp(timestamp.try_into().unwrap(), 0).expect("invalid timestamp");
-    Ok(dt.to_string())
-}
-
-fn get_mp4_size(filename: &PathBuf) -> Result<u64> {
-    let mp4 = read_mp4_video(filename)?;
-
-    Ok(mp4.size())
-}
-
-fn get_mp4_duration(filename: &PathBuf) -> Result<Duration> {
-    let mp4 = read_mp4_video(filename)?;
-
-    Ok(mp4.duration())
-}
-
-const MP4_TO_UNIX_OFFSET: u64 = 2_082_844_800;
-fn read_mp4_video(filename: &PathBuf) -> Result<mp4::Mp4Reader<BufReader<File>>, anyhow::Error> {
-    let f = File::open(filename).unwrap();
-    let size = f.metadata()?.len();
-    let reader = BufReader::new(f);
-    let mp4 = mp4::Mp4Reader::read_header(reader, size)?;
-    Ok(mp4)
+    Ok(VideoMetadata {
+        date: dt.to_string(),
+        video_duration: Some(mp4.duration()),
+    })
 }

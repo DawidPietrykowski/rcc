@@ -535,6 +535,7 @@ dependencies = [
  "glob",
  "mp4",
  "nom-exif",
+ "num-rational",
  "rexiv2",
  "xmp_toolkit",
 ]
