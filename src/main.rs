@@ -1,7 +1,7 @@
-// use crate::xmp::read_rating_xmp;
 use anyhow::{Error, Result, anyhow, bail};
 use chrono::DateTime;
 use clap::{Parser, Subcommand, ValueEnum};
+use nom_exif::*;
 use rexiv2::Metadata;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Debug;
@@ -44,11 +44,16 @@ struct Cli {
     #[arg(short = 'a', long, default_value_t = true)]
     include_videos: bool,
 
+    #[arg(value_enum, default_value_t = CompareMode::Paranoid)]
+    mode: CompareMode,
+
     #[arg(short, long)]
     dest: PathBuf,
 
-    #[arg(short, long, value_delimiter = ' ', num_args = 1..)]
-    src: Vec<PathBuf>,
+    // #[arg(short, long, value_delimiter = ' ', num_args = 1..)]
+    // src: Vec<PathBuf>,
+    #[arg(short, long)]
+    src: PathBuf,
 }
 
 #[derive(Subcommand, PartialEq)]
@@ -57,6 +62,12 @@ enum FileCommand {
     Copy,
     Delete,
     Print,
+}
+
+#[derive(PartialEq, Clone, Copy, ValueEnum)]
+enum CompareMode {
+    Loose,
+    Paranoid,
 }
 
 impl Display for ComparisonCommand {
@@ -83,14 +94,14 @@ struct Entry {
     is_dest: bool,
 }
 
-fn entries_match(a: &CollectedMetadata, b: &CollectedMetadata) -> bool {
+fn entries_match(a: &CollectedMetadata, b: &CollectedMetadata, mode: CompareMode) -> bool {
     if let Some(date) = compare_if_exist(&a.creation_date, &b.creation_date) {
         if !date {
+            // println!("mismatch date");
             return false;
         }
         // println!("match on video date");
     } else {
-        // dates required
         return false;
     }
 
@@ -99,7 +110,10 @@ fn entries_match(a: &CollectedMetadata, b: &CollectedMetadata) -> bool {
             // println!("mismatch on video duration");
             return false;
         }
-        // println!("match on video duration");
+    } else {
+        if VIDEOS_EXTENSIONS.contains(&a.extension.as_str()) && mode == CompareMode::Paranoid {
+            return false;
+        }
     }
 
     if !compare_with_tolerance(a.file_size as f32, b.file_size as f32) {
@@ -108,6 +122,7 @@ fn entries_match(a: &CollectedMetadata, b: &CollectedMetadata) -> bool {
     }
 
     if a.extension != b.extension {
+        // println!("mismatch on extension");
         return false;
     }
 
@@ -144,7 +159,7 @@ fn main() {
 
     rexiv2::initialize().expect("Unable to initialize rexiv2");
 
-    let src_entries = scan_directories(&cli.src, false, &cli);
+    let src_entries = scan_directories(&vec![cli.src.clone()], false, &cli);
     let dest_entries = scan_directories(&vec![cli.dest.clone()], true, &cli);
 
     println!("\nSearching for duplicates\n");
@@ -160,7 +175,7 @@ fn main() {
                 );
                 continue;
             }
-            if entries_match(&dest_entry.metadata, &src_entry.metadata) {
+            if entries_match(&dest_entry.metadata, &src_entry.metadata, cli.mode) {
                 println!(
                     "Duplicate found for: {}: {}",
                     dest_entry.path.display(),
@@ -201,8 +216,9 @@ fn scan_directories(dir_paths: &Vec<PathBuf>, is_dest: bool, cli: &Cli) -> Vec<E
         .expect("Failed to iterate over directories");
     }
     let mut entries = Vec::new();
+    println!("Found files {:?}", paths.len());
     for path in paths {
-        let res: Result<CollectedMetadata> = get_metadata(&path);
+        let res: Result<CollectedMetadata> = get_metadata_nom(&path);
         let Ok(metadata) = res else {
             println!(
                 "Skipping {path:?} due to {}",
@@ -319,12 +335,14 @@ fn visit_dirs(
                     // println!("Adding {path_buf:?}");
                     paths.push(path_buf);
                 } else {
-                    // println!("Skipping {path_buf:?}");
+                    println!("Skipping {path_buf:?}");
                 }
             }
         }
     } else if dir.is_file() {
         paths.push(dir);
+    } else {
+        println!("unknown {dir:?}");
     }
 
     Ok(())
@@ -391,7 +409,8 @@ fn get_metadata(filename: &PathBuf) -> Result<CollectedMetadata> {
             .unwrap()
             .to_os_string()
             .into_string()
-            .unwrap(),
+            .unwrap()
+            .to_lowercase(),
     })
 }
 fn get_timestamp(filename: &PathBuf) -> Result<String> {
@@ -429,19 +448,75 @@ fn is_video(path: &Path) -> bool {
     VIDEOS_EXTENSIONS.contains(&extension.as_str())
 }
 
+fn get_metadata_nom(filename: &PathBuf) -> Result<CollectedMetadata> {
+    let extension = filename
+        .extension()
+        .unwrap()
+        .to_os_string()
+        .into_string()
+        .unwrap()
+        .to_lowercase();
+
+    let date;
+    let duration;
+
+    println!("file: {:?}", filename);
+    if extension == "mp4" {
+        date = get_timestamp(filename).unwrap_or(format!(
+            "{:?}",
+            filename.metadata().unwrap().modified().unwrap()
+        ));
+        duration = get_mp4_duration(filename).ok();
+    } else if VIDEOS_EXTENSIONS.contains(&extension.as_str()) {
+        let mut parser = MediaParser::new();
+        let ms = MediaSource::file_path(filename)?;
+        assert!(ms.has_track());
+        let track_info: TrackInfo = parser.parse(ms)?;
+        duration = track_info
+            .get(TrackInfoTag::DurationMs)
+            .map(|f| Duration::from_millis(f.as_u64().unwrap()));
+        date = track_info
+            .get(TrackInfoTag::CreateDate)
+            .map(|f| f.as_time().unwrap().to_rfc3339())
+            .unwrap();
+    } else {
+        // assert!(ms.has_exif());
+        // let iter: ExifIter = parser.parse(ms).unwrap();
+        // let exif: Exif = iter.into();
+        // date = exif.get(ExifTag::CreateDate).unwrap().to_string();
+        date = get_timestamp(filename).unwrap_or(format!(
+            "{:?}",
+            filename.metadata().unwrap().modified().unwrap()
+        ));
+        duration = None;
+    };
+
+    Ok(CollectedMetadata {
+        base_file_name: filename
+            .file_name()
+            .ok_or(Error::msg("File metadata read error"))?
+            .to_os_string()
+            .into_string()
+            .unwrap(),
+        file_size: filename.metadata()?.size(),
+        creation_date: Some(date),
+        video_duration: duration,
+        extension,
+    })
+}
+
 fn get_mp4_timestamp(filename: &PathBuf) -> Result<String> {
     let mp4 = read_mp4_video(filename)?;
 
     if mp4.moov.mvhd.creation_time == 0 {
         bail!("no creation time");
     }
-    let dt = DateTime::from_timestamp(
-        (mp4.moov.mvhd.creation_time - MP4_TO_UNIX_OFFSET)
-            .try_into()
-            .unwrap(),
-        0,
-    )
-    .expect("invalid timestamp");
+    let timestamp = if mp4.moov.mvhd.creation_time > MP4_TO_UNIX_OFFSET {
+        mp4.moov.mvhd.creation_time - MP4_TO_UNIX_OFFSET
+    } else {
+        mp4.moov.mvhd.creation_time
+    };
+    let dt = DateTime::from_timestamp(timestamp.try_into().unwrap(), 0).expect("invalid timestamp");
     Ok(dt.to_string())
 }
 
