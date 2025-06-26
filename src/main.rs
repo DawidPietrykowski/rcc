@@ -68,6 +68,17 @@ enum FileCommand {
     Print,
 }
 
+impl Display for FileCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FileCommand::Move => f.write_str("move"),
+            FileCommand::Copy => f.write_str("copy"),
+            FileCommand::Delete => f.write_str("delete"),
+            FileCommand::Print => f.write_str("print"),
+        }
+    }
+}
+
 #[derive(PartialEq, Clone, Copy, ValueEnum)]
 enum CompareMode {
     Loose,
@@ -341,8 +352,20 @@ fn main() {
     };
     println!("Total saved space: {}", size_str);
 
-    let mut execution_file = File::create(cli.output).unwrap();
-    execution_file.write("#! /bin/env sh\n".as_bytes()).unwrap();
+    let Some(command) = cli.command else {
+        return;
+    };
+
+    let mut execution_file = File::create(cli.output.clone()).unwrap();
+    execution_file
+        .write("#! /bin/env sh\n\n".as_bytes())
+        .unwrap();
+    execution_file
+        .write_fmt(format_args!(
+            "# rcc -o {:?} -c {} --src {:?} --dest {:?}\n",
+            cli.output, command, cli.src, cli.dest
+        ))
+        .unwrap();
     for action in actions {
         execution_file
             .write_fmt(format_args!(
