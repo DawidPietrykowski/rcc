@@ -225,7 +225,11 @@ impl CompareMetadata<ImageMetadata> for ImageMetadata {
 }
 
 impl CompareMetadata<FileMetadata> for FileMetadata {
-    fn metadata_matches(a: &FileMetadata, b: &FileMetadata, _cli: Cli) -> bool {
+    fn metadata_matches(a: &FileMetadata, b: &FileMetadata, cli: Cli) -> bool {
+        if cli.mode == CompareMode::Paranoid && a.base_file_name != b.base_file_name {
+            return false;
+        }
+
         if !compare_with_tolerance(a.file_size as f32, b.file_size as f32) {
             // println!("mismatch on size");
             return false;
@@ -333,8 +337,9 @@ fn main() {
                         action: command,
                     });
                 }
-            } else if dest_entry.metadata.file_metadata.base_file_name
-                == src_entry.metadata.file_metadata.base_file_name
+            } else if cli.verbose
+                && dest_entry.metadata.file_metadata.base_file_name
+                    == src_entry.metadata.file_metadata.base_file_name
             {
                 println!(
                     "\nFiles have the same base name but did not match: \n{:?}\n{:?}",
