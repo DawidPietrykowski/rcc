@@ -366,6 +366,12 @@ fn main() {
             cli.output, command, cli.src, cli.dest
         ))
         .unwrap();
+    execution_file
+        .write_fmt(format_args!("\n# Total saved space: {}\n", size_str))
+        .unwrap();
+    execution_file
+        .write_fmt(format_args!("\n# Total actions: {}\n", actions.len()))
+        .unwrap();
     for action in actions {
         execution_file
             .write_fmt(format_args!(
