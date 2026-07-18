@@ -22,11 +22,14 @@ const VIDEOS_EXTENSIONS: [&str; 3] = ["mov", "mp4", "avi"];
 
 const MP4_TO_UNIX_OFFSET: u64 = 2_082_844_800;
 
+type Sha256Bytes = sha2::digest::Output<Sha256>;
+
 #[derive(Clone, Eq, PartialEq, Debug)]
 struct CollectedMetadata {
     file_metadata: FileMetadata,
     image_metadata: Option<ImageMetadata>,
     video_metadata: Option<VideoMetadata>,
+    sha_metadata: Option<Sha256Bytes>,
 }
 
 #[derive(Parser, Clone)]
@@ -94,32 +97,21 @@ struct Entry {
     is_dest: bool,
 }
 
-impl Entry {
-    fn exact_match(a: &Entry, b: &Entry) -> bool {
-        let a_sha = Entry::compute_file_sha256(a);
-        let b_sha = Entry::compute_file_sha256(b);
-        match (a_sha, b_sha) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => false,
+fn compute_file_sha256(path: &Path) -> io::Result<sha2::digest::Output<Sha256>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+
+    loop {
+        let bytes_read = reader.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
         }
+        hasher.update(&buffer[..bytes_read]);
     }
 
-    fn compute_file_sha256(&self) -> io::Result<sha2::digest::Output<Sha256>> {
-        let file = File::open(&self.path)?;
-        let mut reader = BufReader::new(file);
-        let mut hasher = Sha256::new();
-        let mut buffer = [0u8; 8192];
-
-        loop {
-            let bytes_read = reader.read(&mut buffer)?;
-            if bytes_read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..bytes_read]);
-        }
-
-        Ok(hasher.finalize())
-    }
+    Ok(hasher.finalize())
 }
 
 impl Display for Entry {
@@ -202,6 +194,16 @@ trait CompareMetadata<T> {
     fn metadata_matches(a: &T, b: &T, mode: Cli) -> bool;
 }
 
+impl CompareMetadata<sha2::digest::Output<Sha256>> for sha2::digest::Output<Sha256> {
+    fn metadata_matches(
+        a: &sha2::digest::Output<Sha256>,
+        b: &sha2::digest::Output<Sha256>,
+        _mode: Cli,
+    ) -> bool {
+        a == b
+    }
+}
+
 #[derive(Default, Clone, Eq, PartialEq, Debug)]
 struct VideoMetadata {
     date: String,
@@ -276,7 +278,11 @@ impl CompareMetadata<FileMetadata> for FileMetadata {
 
 fn entries_match(a: &Entry, b: &Entry, mode: Cli) -> bool {
     if mode.mode == CompareMode::Exact {
-        return Entry::exact_match(a, b);
+        if let (Some(a), Some(b)) = (&a.metadata.sha_metadata, &b.metadata.sha_metadata) {
+            return Sha256Bytes::metadata_matches(a, b, mode.clone());
+        } else {
+            return false;
+        }
     }
     if !FileMetadata::metadata_matches(
         &a.metadata.file_metadata,
@@ -456,7 +462,7 @@ fn scan_directories(dir_paths: &Vec<PathBuf>, is_dest: bool, cli: &Cli) -> Vec<E
     let mut entries = Vec::new();
     println!("Found files {:?}", paths.len());
     for path in paths {
-        let res: Result<CollectedMetadata> = get_metadata_nom(&path);
+        let res: Result<CollectedMetadata> = get_metadata_nom(&path, &cli);
         let Ok(metadata) = res else {
             println!(
                 "Skipping {path:?} due to {}",
@@ -720,10 +726,11 @@ fn is_video(path: &Path) -> bool {
     VIDEOS_EXTENSIONS.contains(&extension.as_str())
 }
 
-fn get_metadata_nom(filename: &PathBuf) -> Result<CollectedMetadata> {
+fn get_metadata_nom(filename: &PathBuf, cli: &Cli) -> Result<CollectedMetadata> {
     let file_metadata = get_file_metadata(filename)?;
     let image_metadata;
     let video_metadata;
+    let sha_metadata;
 
     // println!("file: {:?}", filename);
     if file_metadata.extension == "mp4" {
@@ -737,10 +744,17 @@ fn get_metadata_nom(filename: &PathBuf) -> Result<CollectedMetadata> {
         video_metadata = None;
     };
 
+    if cli.mode == CompareMode::Exact {
+        sha_metadata = compute_file_sha256(filename).ok();
+    } else {
+        sha_metadata = None;
+    }
+
     Ok(CollectedMetadata {
         file_metadata,
         image_metadata,
         video_metadata,
+        sha_metadata,
     })
 }
 
