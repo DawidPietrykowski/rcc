@@ -4,10 +4,11 @@ use clap::{Parser, ValueEnum};
 use nom_exif::*;
 use num_rational::Ratio;
 use rexiv2::Metadata;
+use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fmt::{Debug, Display};
 use std::fs::File;
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::ops::{Mul, Sub};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -83,6 +84,7 @@ impl Display for FileCommand {
 enum CompareMode {
     Loose,
     Paranoid,
+    Exact,
 }
 
 #[derive(Clone, Eq, PartialEq, Debug)]
@@ -90,6 +92,34 @@ struct Entry {
     path: PathBuf,
     metadata: CollectedMetadata,
     is_dest: bool,
+}
+
+impl Entry {
+    fn exact_match(a: &Entry, b: &Entry) -> bool {
+        let a_sha = Entry::compute_file_sha256(a);
+        let b_sha = Entry::compute_file_sha256(b);
+        match (a_sha, b_sha) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    fn compute_file_sha256(&self) -> io::Result<sha2::digest::Output<Sha256>> {
+        let file = File::open(&self.path)?;
+        let mut reader = BufReader::new(file);
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 8192];
+
+        loop {
+            let bytes_read = reader.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..bytes_read]);
+        }
+
+        Ok(hasher.finalize())
+    }
 }
 
 impl Display for Entry {
@@ -244,18 +274,25 @@ impl CompareMetadata<FileMetadata> for FileMetadata {
     }
 }
 
-fn entries_match(a: &CollectedMetadata, b: &CollectedMetadata, mode: Cli) -> bool {
-    if !FileMetadata::metadata_matches(&a.file_metadata, &b.file_metadata, mode.clone()) {
+fn entries_match(a: &Entry, b: &Entry, mode: Cli) -> bool {
+    if mode.mode == CompareMode::Exact {
+        return Entry::exact_match(a, b);
+    }
+    if !FileMetadata::metadata_matches(
+        &a.metadata.file_metadata,
+        &b.metadata.file_metadata,
+        mode.clone(),
+    ) {
         return false;
     }
     let mut metadata_checked = false;
-    if let (Some(a), Some(b)) = (&a.image_metadata, &b.image_metadata) {
+    if let (Some(a), Some(b)) = (&a.metadata.image_metadata, &b.metadata.image_metadata) {
         if !ImageMetadata::metadata_matches(a, b, mode.clone()) {
             return false;
         }
         metadata_checked = true;
     }
-    if let (Some(a), Some(b)) = (&a.video_metadata, &b.video_metadata) {
+    if let (Some(a), Some(b)) = (&a.metadata.video_metadata, &b.metadata.video_metadata) {
         if !VideoMetadata::metadata_matches(a, b, mode.clone()) {
             return false;
         }
@@ -317,7 +354,7 @@ fn main() {
                 );
                 continue;
             }
-            if entries_match(&dest_entry.metadata, &src_entry.metadata, cli.clone()) {
+            if entries_match(&dest_entry, &src_entry, cli.clone()) {
                 println!(
                     "Duplicate found for: {}: {}",
                     dest_entry.path.display(),
